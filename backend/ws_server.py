@@ -18,6 +18,11 @@ class WSServer:
     def __init__(self):
         self._clients: Set[websockets.server.WebSocketServerProtocol] = set()
         self._server = None
+        self._on_command = None  # 回调函数，处理客户端命令
+
+    def set_command_handler(self, handler):
+        """设置客户端命令处理回调"""
+        self._on_command = handler
 
     async def _handler(self, websocket):
         """处理客户端连接"""
@@ -31,9 +36,14 @@ class WSServer:
                 "message": "已连接到翻译服务",
                 "provider": config.TRANSLATOR_PROVIDER,
             }))
-            # 保持连接，监听客户端消息（目前不需要处理）
+            # 监听客户端消息
             async for message in websocket:
-                pass
+                try:
+                    data = json.loads(message)
+                    if data.get("type") == "command" and self._on_command:
+                        await self._on_command(data, websocket)
+                except (json.JSONDecodeError, Exception) as e:
+                    print(f"[WS] 处理客户端消息失败: {e}")
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:

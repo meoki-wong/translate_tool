@@ -43,6 +43,19 @@ if [ -n "$HUNYUAN_SECRET_ID" ] && [ -n "$HUNYUAN_SECRET_KEY" ]; then
     HAS_KEY=true
 fi
 
+# 检查 .env 文件
+ENV_FILE="$PROJECT_DIR/.env"
+if [ "$HAS_KEY" = false ] && [ -f "$ENV_FILE" ]; then
+    ENV_ID=$(grep -E '^HUNYUAN_SECRET_ID=' "$ENV_FILE" | cut -d'=' -f2- | tr -d '[:space:]')
+    ENV_KEY=$(grep -E '^HUNYUAN_SECRET_KEY=' "$ENV_FILE" | cut -d'=' -f2- | tr -d '[:space:]')
+    if [ -n "$ENV_ID" ] && [ -n "$ENV_KEY" ]; then
+        echo "✓ 从 .env 文件读取到混元翻译密钥"
+        export HUNYUAN_SECRET_ID="$ENV_ID"
+        export HUNYUAN_SECRET_KEY="$ENV_KEY"
+        HAS_KEY=true
+    fi
+fi
+
 # 检查 config.py 中是否直接配置了密钥
 if [ "$HAS_KEY" = false ] && [ -f "$CONFIG_FILE" ]; then
     PY_ID=$(python3 -c "

@@ -92,6 +92,27 @@ class RealtimeTranslator:
 
             print(f"[Main] 总延迟: {t2-t0:.2f}s")
 
+    async def _handle_command(self, data, websocket):
+        """处理客户端发来的命令"""
+        action = data.get("action")
+        if action == "switch_provider":
+            provider = data.get("provider")
+            if provider:
+                try:
+                    await self.translator.switch_provider(provider)
+                    config.TRANSLATOR_PROVIDER = provider
+                    print(f"[Main] 翻译厂商已切换: {provider}")
+                    # 通知所有客户端
+                    await self.ws_server.broadcast_status(
+                        "provider_changed",
+                        f"已切换到 {provider}"
+                    )
+                except Exception as e:
+                    print(f"[Main] 切换翻译厂商失败: {e}")
+                    await self.ws_server.broadcast_status(
+                        "error", f"切换失败: {e}"
+                    )
+
     async def run(self):
         """启动所有服务"""
         print("=" * 50)
@@ -103,6 +124,7 @@ class RealtimeTranslator:
         self._running = True
 
         # 1. 启动 WebSocket 服务
+        self.ws_server.set_command_handler(self._handle_command)
         await self.ws_server.start()
 
         # 2. 初始化翻译器

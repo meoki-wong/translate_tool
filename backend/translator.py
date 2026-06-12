@@ -84,7 +84,7 @@ class HunyuanTranslator(TranslatorBase):
             config.HUNYUAN_SECRET_KEY,
         )
         self._client = hunyuan_client.HunyuanClient(
-            config.HUNYUAN_REGION, cred
+            cred, config.HUNYUAN_REGION
         )
         self._models = models
 
@@ -103,11 +103,13 @@ class HunyuanTranslator(TranslatorBase):
         req.Model = config.HUNYUAN_MODEL
         # 精简 prompt，减少 token 处理时间
         system_prompt = "英译中，只输出译文，不解释。"
-
-        messages = [self._make_msg("system", system_prompt)]
         if context:
-            messages.append(self._make_msg("system", f"前文：{context[:100]}"))
-        messages.append(self._make_msg("user", text))
+            system_prompt += f" 前文：{context[:100]}"
+
+        messages = [
+            self._make_msg("system", system_prompt),
+            self._make_msg("user", text),
+        ]
         req.Messages = messages
 
         resp = self._client.ChatCompletions(req)
@@ -324,3 +326,19 @@ class TranslatorManager:
     async def close(self):
         if self._primary:
             await self._primary.close()
+
+    async def switch_provider(self, provider_name: str):
+        """运行时切换翻译厂商"""
+        cls = _TRANSLATOR_MAP.get(provider_name)
+        if cls is None:
+            raise ValueError(
+                f"未知的翻译厂商: {provider_name}。"
+                f"可选: {list(_TRANSLATOR_MAP.keys())}"
+            )
+        # 关闭旧的
+        if self._primary:
+            await self._primary.close()
+        # 创建新的
+        self._primary = cls()
+        self._provider_name = provider_name
+        print(f"[Translator] 已切换到: {provider_name}")
