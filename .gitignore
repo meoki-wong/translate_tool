@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+backend/venv/
+backend/*.egg-info/
+
+# Node.js
+node_modules/
+frontend/dist/
+frontend/src-tauri/target/
+
+# Environment & Secrets
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Tauri build
+frontend/src-tauri/target/
+
+# Icons generator
+frontend/src-tauri/icons/gen_icons.py
