@@ -27,3 +27,6 @@ frontend/src-tauri/target/
 
 # Icons generator
 frontend/src-tauri/icons/gen_icons.py
+
+# vosk model files (too large for git)
+backend/models/

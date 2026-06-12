@@ -1,9 +1,11 @@
 use std::process::{Child, Command};
 use std::sync::Mutex;
 use tauri::Manager;
+use tauri::Window;
 
 pub struct AppState {
     pub python_process: Mutex<Option<Child>>,
+    pub always_on_top: Mutex<bool>,
 }
 
 #[tauri::command]
@@ -14,7 +16,6 @@ fn start_backend(state: tauri::State<AppState>) -> Result<String, String> {
         return Ok("Backend already running".to_string());
     }
 
-    // Try multiple possible paths for the Python binary
     let python_paths = [
         "../backend/venv/bin/python",
         "../../backend/venv/bin/python",
@@ -58,16 +59,25 @@ fn stop_backend(state: tauri::State<AppState>) -> Result<String, String> {
     }
 }
 
+#[tauri::command]
+fn toggle_always_on_top(window: Window, state: tauri::State<AppState>) -> Result<bool, String> {
+    let mut on_top = state.always_on_top.lock().map_err(|e| e.to_string())?;
+    let new_val = !*on_top;
+    *on_top = new_val;
+    window.set_always_on_top(new_val).map_err(|e| e.to_string())?;
+    Ok(new_val)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(AppState {
             python_process: Mutex::new(None),
+            always_on_top: Mutex::new(false),
         })
-        .invoke_handler(tauri::generate_handler![start_backend, stop_backend])
+        .invoke_handler(tauri::generate_handler![start_backend, stop_backend, toggle_always_on_top])
         .setup(|app| {
-            // Auto-start Python backend on app launch
             let state = app.state::<AppState>();
             let mut process = state.python_process.lock().unwrap();
 

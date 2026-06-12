@@ -24,6 +24,29 @@ else
     echo "✓ Python 虚拟环境已就绪"
 fi
 
+# 检查 vosk 模型
+VOSK_MODEL_DIR="$BACKEND_DIR/models/vosk-model-small-en-us-0.15"
+if [ ! -d "$VOSK_MODEL_DIR" ]; then
+    echo "⚠ vosk 语音识别模型未下载，正在下载..."
+    mkdir -p "$BACKEND_DIR/models"
+    cd "$BACKEND_DIR"
+    source venv/bin/activate
+    python -c "
+import urllib.request, zipfile, os
+url = 'https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip'
+dest = 'models/vosk-model-small-en-us-0.15.zip'
+print('正在下载 vosk 模型 (~50MB)...')
+urllib.request.urlretrieve(url, dest)
+print('正在解压...')
+with zipfile.ZipFile(dest, 'r') as z:
+    z.extractall('models')
+os.remove(dest)
+print('✓ vosk 模型已就绪')
+"
+else
+    echo "✓ vosk 模型已就绪"
+fi
+
 # 检查前端依赖
 if [ ! -d "$FRONTEND_DIR/node_modules" ]; then
     echo "⚠ 前端依赖未安装，正在安装..."

@@ -99,6 +99,11 @@ body {
   color: #ef4444;
 }
 
+.pinned-btn {
+  background: rgba(245, 158, 11, 0.2) !important;
+  color: #f59e0b !important;
+}
+
 /* Subtitle Area */
 .subtitle-area {
   flex: 1;
@@ -168,6 +173,29 @@ body {
   font-size: 1em;
   line-height: 1.6;
   font-weight: 500;
+}
+
+/* Live streaming subtitle */
+.live-item {
+  border-left: 3px solid #f59e0b !important;
+  background: rgba(245, 158, 11, 0.06) !important;
+  position: relative;
+}
+
+.live-indicator {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  font-size: 0.6em;
+  color: #f59e0b;
+  font-weight: bold;
+  letter-spacing: 1px;
+  animation: livePulse 1s ease-in-out infinite;
+}
+
+@keyframes livePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
 }
 
 @keyframes fadeIn {

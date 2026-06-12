@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
 interface Subtitle {
   id: number;
@@ -9,10 +10,10 @@ interface Subtitle {
 
 interface WSMessage {
   type: "subtitle" | "status" | "provider_info";
-  en?: string;
+  text?: string;
   zh?: string;
+  final?: boolean;
   timestamp?: string;
-  duration?: number;
   message?: string;
   status_type?: string;
   provider?: string;
@@ -28,21 +29,25 @@ interface ProviderInfo {
 const WS_URL = "ws://localhost:8765";
 
 const PROVIDERS: ProviderInfo[] = [
-  { id: "hunyuan", name: "混元翻译", desc: "腾讯大模型，质量高", needKey: true },
   { id: "mymemory", name: "MyMemory", desc: "免费无需密钥，速度快", needKey: false },
+  { id: "ollama", name: "Ollama", desc: "本地部署，无需联网", needKey: false },
+  { id: "hunyuan", name: "混元翻译", desc: "腾讯大模型，质量高", needKey: true },
   { id: "deepl", name: "DeepL", desc: "高质量，需 API Key", needKey: true },
   { id: "baidu", name: "百度翻译", desc: "需 APP_ID", needKey: true },
   { id: "openai", name: "OpenAI", desc: "GPT 翻译", needKey: true },
 ];
 
 function App() {
-  const [subtitles, setSubtitles] = useState<Subtitle[]>([]);
+  const [history, setHistory] = useState<Subtitle[]>([]);
+  const [liveEn, setLiveEn] = useState("");
+  const [liveZh, setLiveZh] = useState("");
   const [status, setStatus] = useState<string>("等待连接...");
   const [connected, setConnected] = useState(false);
   const [fontSize, setFontSize] = useState(16);
   const [opacity, setOpacity] = useState(0.9);
   const [showSettings, setShowSettings] = useState(false);
-  const [currentProvider, setCurrentProvider] = useState("hunyuan");
+  const [currentProvider, setCurrentProvider] = useState("mymemory");
+  const [isPinned, setIsPinned] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const nextId = useRef(0);
@@ -62,6 +67,16 @@ function App() {
     setStatus(`切换翻译: ${provider}`);
   }, [sendCommand]);
 
+  // Toggle always on top
+  const togglePin = useCallback(async () => {
+    try {
+      const newVal = await invoke<boolean>("toggle_always_on_top");
+      setIsPinned(newVal);
+    } catch (e) {
+      console.error("Toggle pin failed:", e);
+    }
+  }, []);
+
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
@@ -77,33 +92,24 @@ function App() {
       try {
         const msg: WSMessage = JSON.parse(event.data);
 
-        if (msg.type === "subtitle" && msg.en) {
-          const enText = msg.en;
-          if (msg.zh) {
-            const zhText = msg.zh;
-            setSubtitles((prev) => {
-              const updated = [...prev];
-              const last = updated[updated.length - 1];
-              if (last && last.en === enText) {
-                last.zh = zhText;
-              } else {
-                updated.push({
-                  id: nextId.current++,
-                  en: enText,
-                  zh: zhText,
-                  timestamp: msg.timestamp || new Date().toISOString(),
-                });
-              }
-              return updated.slice(-50);
-            });
-          } else {
+        if (msg.type === "subtitle" && msg.text) {
+          if (msg.final) {
+            // 已提交的完整句子 → 加入历史，清空 live
             const newSub: Subtitle = {
               id: nextId.current++,
-              en: msg.en,
-              zh: "...",
+              en: msg.text,
+              zh: msg.zh || "",
               timestamp: msg.timestamp || new Date().toISOString(),
             };
-            setSubtitles((prev) => [...prev.slice(-50), newSub]);
+            setHistory((prev) => [...prev.slice(-30), newSub]);
+            setLiveEn("");
+            setLiveZh("");
+          } else {
+            // 实时 partial → 更新 live 区域
+            setLiveEn(msg.text);
+            if (msg.zh) {
+              setLiveZh(msg.zh);
+            }
           }
           setStatus("就绪");
         } else if (msg.type === "status") {
@@ -145,7 +151,7 @@ function App() {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [subtitles]);
+  }, [history, liveEn, liveZh]);
 
   return (
     <div className="app-container" style={{ opacity }}>
@@ -163,7 +169,8 @@ function App() {
           <button className="control-btn" onClick={() => setOpacity((o) => Math.max(0.3, +(o - 0.1).toFixed(1)))} title="降低透明度">◐</button>
           <button className="control-btn" onClick={() => setOpacity((o) => Math.min(1, +(o + 0.1).toFixed(1)))} title="提高透明度">●</button>
           <button className="control-btn" onClick={() => setShowSettings((s) => !s)} title="设置">⚙</button>
-          <button className="control-btn close-btn" onClick={() => setSubtitles([])} title="清空">✕</button>
+          <button className={`control-btn ${isPinned ? "pinned-btn" : ""}`} onClick={togglePin} title={isPinned ? "取消置顶" : "置顶"}>{isPinned ? "📌" : "📍"}</button>
+          <button className="control-btn close-btn" onClick={() => { setHistory([]); setLiveEn(""); setLiveZh(""); }} title="清空">✕</button>
         </div>
       </div>
 
@@ -203,18 +210,29 @@ function App() {
 
       {/* Subtitle display area */}
       <div className="subtitle-area" ref={scrollRef} style={{ fontSize: `${fontSize}px` }}>
-        {subtitles.length === 0 ? (
+        {history.length === 0 && !liveEn ? (
           <div className="empty-hint">
             <p>等待音频输入...</p>
             <p className="sub-hint">请确保 BlackHole 已配置且浏览器正在播放英文内容</p>
           </div>
         ) : (
-          subtitles.map((sub) => (
-            <div key={sub.id} className="subtitle-item">
-              <div className="en-text">{sub.en}</div>
-              <div className="zh-text">{sub.zh}</div>
-            </div>
-          ))
+          <>
+            {/* 已提交的历史字幕 */}
+            {history.map((sub) => (
+              <div key={sub.id} className="subtitle-item">
+                <div className="en-text">{sub.en}</div>
+                <div className="zh-text">{sub.zh}</div>
+              </div>
+            ))}
+            {/* 实时流式字幕 */}
+            {liveEn && (
+              <div className="subtitle-item live-item">
+                <div className="en-text">{liveEn}</div>
+                <div className="zh-text">{liveZh || "..."}</div>
+                <div className="live-indicator">LIVE</div>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>

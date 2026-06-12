@@ -1,6 +1,6 @@
 """
 翻译模块 - 可插拔多厂商架构（策略模式）
-支持: 混元翻译(默认)、DeepL、百度、OpenAI、MyMemory
+支持: 混元翻译(默认)、DeepL、百度、OpenAI、MyMemory、Ollama(本地)
 """
 import abc
 import json
@@ -254,6 +254,45 @@ class OpenAITranslator(TranslatorBase):
         await self._client.aclose()
 
 
+# ==================== Ollama（本地部署） ====================
+
+class OllamaTranslator(TranslatorBase):
+    """Ollama 本地模型翻译 - 无需联网，通过 OpenAI 兼容 API"""
+
+    def __init__(self):
+        self._client = httpx.AsyncClient(
+            base_url=config.OLLAMA_BASE_URL,
+            headers={
+                # 跳过 ngrok 免费版浏览器拦截页
+                "ngrok-skip-browser-warning": "true",
+            },
+            timeout=60,  # 本地模型可能较慢
+        )
+
+    async def translate(self, text: str, context: str = "") -> str:
+        system_prompt = "英译中，只输出译文，不解释。"
+        if context:
+            system_prompt += f" 前文：{context[:100]}"
+
+        resp = await self._client.post(
+            "/api/chat",
+            json={
+                "model": config.OLLAMA_MODEL,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text},
+                ],
+                "stream": False,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["message"]["content"].strip()
+
+    async def close(self):
+        await self._client.aclose()
+
+
 # ==================== 翻译器工厂 ====================
 
 _TRANSLATOR_MAP = {
@@ -262,14 +301,15 @@ _TRANSLATOR_MAP = {
     "deepl": DeepLTranslator,
     "baidu": BaiduTranslator,
     "openai": OpenAITranslator,
+    "ollama": OllamaTranslator,
 }
 
 # 降级顺序：主厂商失败时依次尝试
-_FALLBACK_CHAIN = ["mymemory", "deepl", "baidu"]
+# 已禁用自动降级 - 选什么用什么
 
 
 class TranslatorManager:
-    """翻译管理器 - 支持切换厂商和自动降级"""
+    """翻译管理器 - 支持运行时切换，无自动降级"""
 
     def __init__(self):
         self._cache = TranslationCache(config.TRANSLATION_CACHE_SIZE)
@@ -288,7 +328,7 @@ class TranslatorManager:
         print(f"[Translator] 初始化翻译厂商: {self._provider_name}")
 
     async def translate(self, text: str, context: str = "") -> str:
-        """翻译文本（带缓存和降级）"""
+        """翻译文本（带缓存，无降级）"""
         if not text.strip():
             return ""
 
@@ -298,30 +338,10 @@ class TranslatorManager:
         if cached:
             return cached
 
-        # 尝试主厂商
-        try:
-            result = await self._primary.translate(text, context)
-            self._cache.put(cache_key, result)
-            return result
-        except Exception as e:
-            print(f"[Translator] 主厂商 {self._provider_name} 失败: {e}")
-
-        # 降级到备选厂商
-        for fallback_name in _FALLBACK_CHAIN:
-            if fallback_name == self._provider_name:
-                continue
-            try:
-                print(f"[Translator] 尝试降级到: {fallback_name}")
-                cls = _TRANSLATOR_MAP[fallback_name]
-                fallback = cls()
-                result = await fallback.translate(text, context)
-                await fallback.close()
-                self._cache.put(cache_key, result)
-                return result
-            except Exception as e:
-                print(f"[Translator] 降级厂商 {fallback_name} 也失败: {e}")
-
-        return f"[翻译失败] {text}"
+        # 直接调用选定的厂商，失败则抛异常
+        result = await self._primary.translate(text, context)
+        self._cache.put(cache_key, result)
+        return result
 
     async def close(self):
         if self._primary:
