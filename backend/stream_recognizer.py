@@ -1,11 +1,11 @@
 """
-流式语音识别模块 - 基于 vosk 的实时流式 ASR
-逐词输出识别结果，替代 faster-whisper 的段落式识别
+流式语音识别模块 - 基于 vosk 的实时流式 ASR（跨平台）
+
+macOS:  使用 BlackHole 虚拟声卡捕获系统音频
+Windows: 使用 WASAPI 回环直接捕获系统音频（无需虚拟声卡）
 """
 import json
-import queue
-import threading
-import os
+import platform
 from pathlib import Path
 
 import numpy as np
@@ -14,12 +14,25 @@ from vosk import Model, KaldiRecognizer
 
 import config
 
+# 根据平台导入对应音频模块
+SYSTEM = platform.system()
+if SYSTEM == "Darwin":
+    from audio import mac_audio as _audio_provider
+elif SYSTEM == "Windows":
+    from audio import win_audio as _audio_provider
+else:
+    _audio_provider = None
+
 
 class StreamRecognizer:
-    """基于 vosk 的流式语音识别器
+    """基于 vosk 的流式语音识别器（跨平台）
     
     直接从音频设备捕获音频并实时识别，
     通过回调函数推送 partial（中间结果）和 final（最终结果）。
+    
+    平台差异:
+    - macOS:   BlackHole 虚拟声卡（需额外安装）
+    - Windows: WASAPI 回环（原生支持，无需安装）
     """
 
     def __init__(self):
@@ -29,6 +42,7 @@ class StreamRecognizer:
         self._running = False
         self._device_index = None
         self._on_result = None  # callback(result_type: str, text: str)
+        self._platform = SYSTEM
 
     def set_result_callback(self, callback):
         """设置结果回调函数
@@ -60,27 +74,36 @@ class StreamRecognizer:
     def loaded(self) -> bool:
         return self._model is not None
 
-    def find_device(self) -> int | None:
-        """查找 BlackHole 虚拟声卡输入设备"""
-        devices = sd.query_devices()
-        for i, dev in enumerate(devices):
-            if (config.BLACKHOLE_DEVICE_NAME.lower() in dev['name'].lower()
-                    and dev['max_input_channels'] > 0):
-                print(f"[StreamRecognizer] 找到设备: [{i}] {dev['name']}")
-                self._device_index = i
-                return i
+    @property
+    def platform_info(self) -> str:
+        """当前平台信息"""
+        return f"{self._platform} / {_audio_provider.__name__ if _audio_provider else 'unknown'}"
 
-        print("[StreamRecognizer] 未找到 BlackHole，可用输入设备:")
-        for i, dev in enumerate(devices):
-            if dev['max_input_channels'] > 0:
-                print(f"  [{i}] {dev['name']} (ch: {dev['max_input_channels']})")
-        return None
+    def find_device(self) -> int | None:
+        """查找音频设备（跨平台）
+        
+        macOS:   查找 BlackHole 虚拟声卡输入设备
+        Windows: 查找 WASAPI 回环输出设备
+        
+        Returns:
+            设备索引，未找到返回 None
+        """
+        if _audio_provider is None:
+            print(f"[StreamRecognizer] 不支持的平台: {self._platform}")
+            return None
+
+        self._device_index = _audio_provider.find_device()
+        return self._device_index
 
     def _audio_callback(self, indata: np.ndarray, frames: int,
                         time_info, status):
         """音频回调 - 每个音频块直接送入 vosk 识别"""
         if status:
-            print(f"[StreamRecognizer] 音频状态: {status}")
+            # 仅在严重错误时打印，xrun（溢出）属于正常现象
+            if hasattr(status, 'input_overflow') and status.input_overflow:
+                pass  # 忽略常见的溢出警告
+            else:
+                print(f"[StreamRecognizer] 音频状态: {status}")
 
         if not self._running or not self._recognizer:
             return
@@ -121,40 +144,53 @@ class StreamRecognizer:
             self.find_device()
 
         if self._device_index is None:
+            # 使用平台对应的错误提示
+            if _audio_provider:
+                raise RuntimeError(_audio_provider.INSTALL_HINT)
             raise RuntimeError(
-                "未找到 BlackHole 虚拟声卡。\n"
-                "请先安装: brew install blackhole-2ch\n"
-                "然后配置多输出设备。"
+                f"不支持的平台: {self._platform}，仅支持 macOS 和 Windows"
             )
 
-        block_size = int(config.SAMPLE_RATE * config.BLOCK_DURATION)
+        # 获取平台对应的流参数
+        stream_params = _audio_provider.get_stream_params(
+            self._device_index,
+            config.SAMPLE_RATE,
+            config.CHANNELS,
+            config.BLOCK_DURATION,
+        )
+
         self._running = True
 
+        # 创建并启动音频流
         self._stream = sd.InputStream(
-            device=self._device_index,
-            samplerate=config.SAMPLE_RATE,
-            channels=config.CHANNELS,
-            dtype='int16',
-            blocksize=block_size,
             callback=self._audio_callback,
+            **stream_params,
         )
         self._stream.start()
-        print(f"[StreamRecognizer] 流式识别已启动 "
-              f"(设备: {self._device_index}, "
-              f"采样率: {config.SAMPLE_RATE}Hz, "
-              f"块大小: {block_size})")
+
+        # 打印设备信息
+        dev_info = _audio_provider.get_device_info(self._device_index)
+        print(f"[StreamRecognizer] 流式识别已启动")
+        print(f"  平台: {dev_info['platform']} ({dev_info['method']})")
+        print(f"  设备: [{self._device_index}] {dev_info['name']}")
+        print(f"  采样率: {config.SAMPLE_RATE}Hz, 通道: {config.CHANNELS}")
 
     def stop(self):
         """停止流式识别"""
         self._running = False
         if self._stream:
-            self._stream.stop()
-            self._stream.close()
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception as e:
+                print(f"[StreamRecognizer] 停止音频流异常: {e}")
             self._stream = None
         print("[StreamRecognizer] 流式识别已停止")
 
     def reset(self):
         """重置识别器状态（切换句子时调用）"""
         if self._recognizer:
-            # vosk 的 Reset 会清除内部状态
-            self._recognizer.Reset()
+            try:
+                self._recognizer.Reset()
+            except Exception as e:
+                print(f"[StreamRecognizer] 重置异常: {e}")

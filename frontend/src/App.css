@@ -182,6 +182,17 @@ body {
   position: relative;
 }
 
+.live-item .en-text {
+  transition: all 0.15s ease;
+  color: #fbbf24;
+}
+
+.live-item .zh-text {
+  transition: all 0.3s ease;
+  color: #e2e8f0;
+  animation: fadeIn 0.3s ease;
+}
+
 .live-indicator {
   position: absolute;
   top: 8px;

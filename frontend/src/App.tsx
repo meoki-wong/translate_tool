@@ -105,7 +105,7 @@ function App() {
             setLiveEn("");
             setLiveZh("");
           } else {
-            // 实时 partial → 更新 live 区域
+            // 实时 partial → 更新英文 + 投机翻译中文（如有）
             setLiveEn(msg.text);
             if (msg.zh) {
               setLiveZh(msg.zh);
@@ -228,7 +228,7 @@ function App() {
             {liveEn && (
               <div className="subtitle-item live-item">
                 <div className="en-text">{liveEn}</div>
-                <div className="zh-text">{liveZh || "..."}</div>
+                {liveZh && <div className="zh-text">{liveZh}</div>}
                 <div className="live-indicator">LIVE</div>
               </div>
             )}

@@ -8,7 +8,8 @@ BACKEND_DIR="$PROJECT_DIR/backend"
 FRONTEND_DIR="$PROJECT_DIR/frontend"
 
 echo "====================================="
-echo "  Mac 实时音频翻译工具"
+echo "  实时音频翻译工具"
+echo "  平台: $(uname -s)"
 echo "====================================="
 echo ""
 

@@ -8,6 +8,23 @@ pub struct AppState {
     pub always_on_top: Mutex<bool>,
 }
 
+/// 获取 Python 可执行文件路径列表（跨平台）
+fn get_python_paths() -> Vec<(&'static str, &'static str)> {
+    if cfg!(target_os = "windows") {
+        vec![
+            (r"..\backend\venv\Scripts\python.exe", r"..\backend\main.py"),
+            (r"..\..\backend\venv\Scripts\python.exe", r"..\..\backend\main.py"),
+            (r".\backend\venv\Scripts\python.exe", r".\backend\main.py"),
+        ]
+    } else {
+        vec![
+            ("../backend/venv/bin/python", "../backend/main.py"),
+            ("../../backend/venv/bin/python", "../../backend/main.py"),
+            ("./backend/venv/bin/python", "./backend/main.py"),
+        ]
+    }
+}
+
 #[tauri::command]
 fn start_backend(state: tauri::State<AppState>) -> Result<String, String> {
     let mut process = state.python_process.lock().map_err(|e| e.to_string())?;
@@ -16,20 +33,12 @@ fn start_backend(state: tauri::State<AppState>) -> Result<String, String> {
         return Ok("Backend already running".to_string());
     }
 
-    let python_paths = [
-        "../backend/venv/bin/python",
-        "../../backend/venv/bin/python",
-        "./backend/venv/bin/python",
-    ];
-
+    let paths = get_python_paths();
     let mut last_err = String::new();
-    for py_path in &python_paths {
+
+    for (py_path, script_path) in &paths {
         match Command::new(py_path)
-            .arg(if py_path.contains("../../") || py_path.contains("./backend") {
-                if py_path.contains("../../") { "../../backend/main.py" } else { "./backend/main.py" }
-            } else {
-                "../backend/main.py"
-            })
+            .arg(script_path)
             .spawn()
         {
             Ok(child) => {
@@ -81,13 +90,9 @@ pub fn run() {
             let state = app.state::<AppState>();
             let mut process = state.python_process.lock().unwrap();
 
-            let python_paths = [
-                ("../backend/venv/bin/python", "../backend/main.py"),
-                ("../../backend/venv/bin/python", "../../backend/main.py"),
-                ("./backend/venv/bin/python", "./backend/main.py"),
-            ];
+            let paths = get_python_paths();
 
-            for (py, script) in &python_paths {
+            for (py, script) in &paths {
                 match Command::new(py).arg(script).spawn() {
                     Ok(child) => {
                         println!("Python backend started: {}", py);

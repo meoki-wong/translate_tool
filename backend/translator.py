@@ -3,6 +3,7 @@
 支持: 混元翻译(默认)、DeepL、百度、OpenAI、MyMemory、Ollama(本地)
 """
 import abc
+import asyncio
 import json
 import hashlib
 import time
@@ -101,10 +102,12 @@ class HunyuanTranslator(TranslatorBase):
     def _translate_sync(self, text: str, context: str = "") -> str:
         req = self._models.ChatCompletionsRequest()
         req.Model = config.HUNYUAN_MODEL
-        # 精简 prompt，减少 token 处理时间
-        system_prompt = "英译中，只输出译文，不解释。"
+        system_prompt = (
+            "你是专业英中翻译。将英文翻译为自然流畅的中文。"
+            "只输出译文，不要解释、不要加引号、不要加注释。"
+        )
         if context:
-            system_prompt += f" 前文：{context[:100]}"
+            system_prompt += f" 前文参考：{context[:100]}"
 
         messages = [
             self._make_msg("system", system_prompt),
@@ -126,18 +129,38 @@ class MyMemoryTranslator(TranslatorBase):
     """MyMemory 翻译 - 无需注册，适合开发调试"""
 
     BASE_URL = "https://api.mymemory.translated.net/get"
+    MAX_CHARS = 500  # MyMemory 单次请求上限
 
     def __init__(self):
-        self._client = httpx.AsyncClient(timeout=10)
+        self._client = httpx.AsyncClient(timeout=15)
+
+    @staticmethod
+    def _clean_text(text: str) -> str:
+        """清理文本：去除多余空格和换行"""
+        import re
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
 
     async def translate(self, text: str, context: str = "") -> str:
+        text = self._clean_text(text)
+        if not text:
+            return ""
+
+        # 超长文本截断（MyMemory 限制 500 字符）
+        if len(text) > self.MAX_CHARS:
+            text = text[:self.MAX_CHARS]
+
         resp = await self._client.get(
             self.BASE_URL,
             params={"q": text, "langpair": "en|zh-CN"},
         )
         resp.raise_for_status()
         data = resp.json()
-        return data.get("responseData", {}).get("translatedText", "")
+        result = data.get("responseData", {}).get("translatedText", "")
+        # MyMemory 有时会返回大写或带奇怪符号，清理一下
+        if result and result == result.upper() and len(result) > 3:
+            result = result.capitalize()
+        return result
 
     async def close(self):
         await self._client.aclose()
@@ -257,40 +280,101 @@ class OpenAITranslator(TranslatorBase):
 # ==================== Ollama（本地部署） ====================
 
 class OllamaTranslator(TranslatorBase):
-    """Ollama 本地模型翻译 - 无需联网，通过 OpenAI 兼容 API"""
+    """Ollama 本地模型翻译 - 无需联网，通过 Ollama API"""
+
+    MAX_RETRIES = 2  # 最多重试次数
 
     def __init__(self):
-        self._client = httpx.AsyncClient(
-            base_url=config.OLLAMA_BASE_URL,
-            headers={
-                # 跳过 ngrok 免费版浏览器拦截页
-                "ngrok-skip-browser-warning": "true",
-            },
-            timeout=60,  # 本地模型可能较慢
+        # 本地直连（localhost / 127.0.0.1）使用长驻 client 以复用 keep-alive；
+        # ngrok 等远程场景仍每次新建 client，避免连接池失效。
+        self._base_url = config.OLLAMA_BASE_URL
+        self._headers = {"ngrok-skip-browser-warning": "true"}
+        self._is_local = (
+            "localhost" in self._base_url
+            or "127.0.0.1" in self._base_url
+        )
+        self._client: Optional[httpx.AsyncClient] = (
+            httpx.AsyncClient(
+                base_url=self._base_url,
+                headers=self._headers,
+                timeout=60,
+            ) if self._is_local else None
         )
 
     async def translate(self, text: str, context: str = "") -> str:
-        system_prompt = "英译中，只输出译文，不解释。"
-        if context:
-            system_prompt += f" 前文：{context[:100]}"
-
-        resp = await self._client.post(
-            "/api/chat",
-            json={
-                "model": config.OLLAMA_MODEL,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": text},
-                ],
-                "stream": False,
-            },
+        system_prompt = (
+            "你是严格的英中翻译机。规则：\n"
+            "1. 仅输出用户输入英文的中文翻译，一句一译。\n"
+            "2. 不要解释、不要扩展、不要补充、不要联想。\n"
+            "3. 不要加引号、括号、标题、标号或标记。\n"
+            "4. 输入即使不完整也只译已有内容，不要猜测下文。\n"
+            "5. 输出不得超过一行。"
         )
-        resp.raise_for_status()
-        data = resp.json()
-        return data["message"]["content"].strip()
+        if context:
+            system_prompt += f"\n前文参考：{context[:100]}"
+
+        payload = {
+            "model": config.OLLAMA_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            "stream": False,
+            # 防幻觉 / 防自由发挥：限制生成长度、降低随机性、设置停词
+            "options": {
+                "temperature": 0.2,
+                "top_p": 0.8,
+                "num_predict": 160,
+                "stop": ["\n\n", "User:", "用户：", "译文：", "原文："],
+            },
+        }
+
+        last_err = None
+        for attempt in range(self.MAX_RETRIES + 1):
+            try:
+                if self._is_local and self._client is not None:
+                    resp = await self._client.post("/api/chat", json=payload)
+                    resp.raise_for_status()
+                    data = resp.json()
+                else:
+                    async with httpx.AsyncClient(
+                        base_url=self._base_url,
+                        headers=self._headers,
+                        timeout=60,
+                    ) as client:
+                        resp = await client.post("/api/chat", json=payload)
+                        resp.raise_for_status()
+                        data = resp.json()
+                result = data["message"]["content"].strip()
+                # 后处理：截到第一段，防止模型在译文后举例/补充/联想
+                if "\n\n" in result:
+                    result = result.split("\n\n", 1)[0].strip()
+                # 进一步取第一行（语音翻译场景不需多行）
+                if "\n" in result:
+                    first_line = result.split("\n", 1)[0].strip()
+                    if first_line:
+                        result = first_line
+                # 清理常见的大模型输出瑕疵
+                if result.startswith('"') and result.endswith('"'):
+                    result = result[1:-1]
+                if result.startswith('「') and result.endswith('」'):
+                    result = result[1:-1]
+                # 异常长度保护：中文译文超过输入字符 6 倍认为幻觉，丢弃并以空串兑现
+                if len(text) > 0 and len(result) > len(text) * 6:
+                    print(f"[Ollama] 警告：输出过长可能幻觉（输入{len(text)}字/输出{len(result)}字）丢弃")
+                    return ""
+                return result
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                last_err = e
+                if attempt < self.MAX_RETRIES:
+                    await asyncio.sleep(1)  # 等待 1s 后重试
+                    continue
+                raise
 
     async def close(self):
-        await self._client.aclose()
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
 
 # ==================== 翻译器工厂 ====================
