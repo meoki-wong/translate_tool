@@ -35,6 +35,8 @@ class WSServer:
                 "type": "status",
                 "message": "已连接到翻译服务",
                 "provider": config.TRANSLATOR_PROVIDER,
+                "source_lang": config.SOURCE_LANG,
+                "target_lang": config.TARGET_LANG,
             }))
             # 监听客户端消息
             async for message in websocket:

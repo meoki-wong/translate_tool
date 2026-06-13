@@ -10,6 +10,7 @@
   - 否则快速翻译最终文本
 """
 import asyncio
+import os
 import signal
 import time
 from pathlib import Path
@@ -79,6 +80,7 @@ class RealtimeTranslator:
         self._last_committed = ""      # 上次提交的文本（防止重复提交）
         self._committed_segments = []  # 当前 utterance 内已提交的所有片段（用于多轮剥离）
         self._commit_time = 0          # 上次提交时间戳
+        self._committed_word_count = 0 # 当前 utterance 内已提交的累积词数（用于截取 partial 尾部）
 
         # ── 投机翻译状态（序号 + 有限并发）──
         self._speculative_zh = ""          # 最新采纳的投机翻译中文
@@ -90,6 +92,7 @@ class RealtimeTranslator:
 
         # ── 主循环辅助 ──
         self._stash = None             # 折叠 partial 时临时暂存的非-partial 项
+        self._pending_commit = None    # 后台提交 task（非阻塞化）
 
         # ── 翻译锁 ──
         self._translating = False      # 是否正在提交翻译（防止并发）
@@ -119,6 +122,7 @@ class RealtimeTranslator:
         if time.time() - self._commit_time > 5.0:
             # 超时清空已提交片段列表，避免跨 utterance 误剥离
             self._committed_segments.clear()
+            self._committed_word_count = 0
             return text
 
         changed = True
@@ -192,36 +196,43 @@ class RealtimeTranslator:
             if result_type == "partial":
                 self._last_text_time = now
 
-                # 剥离已提交词序列（防 vosk 累积 / 重叠）
-                text = self._strip_committed(text)
-                if not text:
-                    continue
+                # 剥离已提交词序列得到增量文本（仅用于内部判断）
+                stripped = self._strip_committed(text)
 
-                # 防止重复提交：刚提交过的相同文本不再触发
-                if text == self._last_committed:
-                    continue
+                # 前端推送：截取 partial 中已提交词数之后的尾部
+                # 这样 live 区只显示未提交的新内容，不会叠加已提交文字
+                all_words = text.split()
+                if len(all_words) > self._committed_word_count:
+                    display_text = " ".join(all_words[self._committed_word_count:])
+                else:
+                    display_text = ""
 
-                # partial 是 vosk 当前 utterance 的完整假设文本
-                # 直接推送给前端显示（英文实时更新）
-                if text != self._last_partial:
-                    self._last_partial = text
+                if display_text and display_text != self._last_partial:
+                    self._last_partial = display_text
                     await self.ws_server.broadcast_partial(
-                        text, self._speculative_zh
+                        display_text, self._speculative_zh
                     )
+                elif not display_text:
+                    # 无新内容可显示，清空 live 区
+                    if self._last_partial:
+                        self._last_partial = ""
+                        await self.ws_server.broadcast_partial("", "")
 
-                # ★ 核心：partial 词数达到阈值时强制提交，防止无限累积
-                partial_words = len(text.split())
+                # 无增量内容则跳过后续逻辑
+                if not stripped or stripped == self._last_committed:
+                    continue
+
+                # ★ 核心：增量词数达到阈值时强制提交
+                partial_words = len(stripped.split())
                 if (partial_words >= config.PARTIAL_COMMIT_THRESHOLD
                         and (now - self._commit_time) > 0.5):  # 提交后冷却 0.5s
-                    print(f"[Main] partial 达到 {partial_words} 词，强制提交")
-                    # partial 是当前 utterance 的完整假设（含之前 final 已累积的词），
-                    # 直接替换 sentence_buffer，不拼接，避免重复
-                    self._sentence_buffer = text
+                    print(f"[Main] partial 增量达到 {partial_words} 词，强制提交")
+                    # sentence_buffer 用增量文本（stripped），不含已提交内容
+                    self._sentence_buffer = stripped
                     await self._commit_sentence()
                     continue
 
-                # 投机翻译：partial 词数达到阈值时提前翻译
-                # 不再取消旧任务，改为有限并发 + 序号丢弃过期结果
+                # 投机翻译：基于增量文本判断词数
                 _max_inflight = config.SPECULATIVE_MAX_INFLIGHT
                 _inflight_ok = (
                     _max_inflight <= 0
@@ -231,12 +242,12 @@ class RealtimeTranslator:
                         and now > self._rate_limited_until
                         and (now - self._last_speculative_time) > config.SPECULATIVE_INTERVAL
                         and _inflight_ok
-                        and text != self._speculative_en):
+                        and stripped != self._speculative_en):
                     self._last_speculative_time = now
                     self._speculative_seq += 1
                     seq = self._speculative_seq
                     task = asyncio.create_task(
-                        self._speculative_translate(text, seq)
+                        self._speculative_translate(stripped, seq)
                     )
                     self._inflight_tasks.add(task)
                     task.add_done_callback(self._inflight_tasks.discard)
@@ -293,8 +304,12 @@ class RealtimeTranslator:
             self._speculative_en = text
             # 错配保护：task text 较 current_full 落后过多时，
             # 仅保留状态供 commit 复用，不主动推送 UI，
-            # 避免出现“老中文 + 新英文”的视觉错配。
+            # 避免出现"老中文 + 新英文"的视觉错配。
             if len(current_full.split()) - len(text.split()) > 3:
+                return
+            # 仅在英文文本与 current_full 一致时推送，
+            # 避免中文单独跳变导致 UI 闪烁
+            if current_full != self._last_partial:
                 return
             await self.ws_server.broadcast_partial(current_full, zh)
         except asyncio.CancelledError:
@@ -316,45 +331,77 @@ class RealtimeTranslator:
             await self._commit_sentence()
 
     async def _commit_sentence(self):
-        """提交当前句子：复用投机翻译 或 快速翻译 → 推送 → 重置"""
+        """提交当前句子：复用投机翻译 或 快速翻译 → 推送 → 重置
+
+        翻译阶段不阻塞主循环：若需要调用翻译器，将翻译放入后台 task，
+        主循环可继续处理 partial。若复用投机翻译结果则直接推送（零延迟）。
+        """
         text = self._sentence_buffer.strip()
         if not text:
             return
 
-        # 防止并发翻译
+        # 防止并发提交
         if self._translating:
             return
 
         print(f"[Main] 提交句子 ({len(text.split())} 词): {text}")
 
-        # 不再 cancel 在飞的投机翻译，让其自然结束，并通过推高 latest_seq 使结果作废
-
         zh_text = ""
 
-        # 尝试复用投机翻译结果（词级前缀判定）
+        # 尝试复用投机翻译结果（词级前缀判定）— 零延迟路径
         if self._speculative_zh and self._speculative_en:
             coverage = _word_prefix_coverage(self._speculative_en, text)
             if coverage >= config.SPECULATIVE_REUSE_RATIO:
                 zh_text = self._speculative_zh
                 print(f"[Main] 复用投机翻译 (词级覆盖率: {coverage:.0%}): {zh_text}")
 
-        # 未能复用 → 快速翻译最终文本
-        if not zh_text and time.time() > self._rate_limited_until:
+        if zh_text:
+            # 零延迟：直接推送复用结果
+            await self._finalize_commit(text, zh_text)
+        elif time.time() > self._rate_limited_until:
+            # 需要翻译：非阻塞化，后台 task 执行
             self._translating = True
-            try:
-                zh_text = await self.translator.translate(text, self._context_zh)
-                print(f"[Main] 翻译结果: {zh_text}")
-            except Exception as e:
-                err_str = str(e)
-                if "429" in err_str or "Too Many" in err_str:
-                    self._rate_limited_until = time.time() + 30
-                    print(f"[Main] 翻译服务被限流，暂停 30s")
-                else:
-                    print(f"[Main] 翻译失败: {e}")
-                zh_text = ""
-            finally:
-                self._translating = False
+            # 立即设置 _last_committed 和 _commit_time，让后续 partial 能正确剥离
+            self._last_committed = text
+            self._commit_time = time.time()
+            if self._last_committed:
+                self._committed_segments.append(self._last_committed)
+                self._committed_word_count += len(text.split())
+            # 立即清空 sentence_buffer，让主循环继续接收新 partial
+            self._sentence_buffer = ""
+            self._last_partial = ""
+            self._speculative_zh = ""
+            self._speculative_en = ""
+            self._speculative_latest_seq = self._speculative_seq
+            commit_text = text  # 闭包捕获
+            if self._pending_commit and not self._pending_commit.done():
+                self._pending_commit.cancel()
+            self._pending_commit = asyncio.create_task(
+                self._do_commit_translate(commit_text)
+            )
+        else:
+            # 被限流，直接推送无翻译结果
+            await self._finalize_commit(text, "")
 
+    async def _do_commit_translate(self, text: str):
+        """后台执行提交翻译（不阻塞主循环）"""
+        zh_text = ""
+        try:
+            zh_text = await self.translator.translate(text, self._context_zh)
+            print(f"[Main] 翻译结果: {zh_text}")
+        except Exception as e:
+            err_str = str(e)
+            if "429" in err_str or "Too Many" in err_str:
+                self._rate_limited_until = time.time() + 30
+                print(f"[Main] 翻译服务被限流，暂停 30s")
+            else:
+                print(f"[Main] 翻译失败: {e}")
+        finally:
+            self._translating = False
+        await self._finalize_commit(text, zh_text)
+
+    async def _finalize_commit(self, text: str, zh_text: str):
+        """提交收尾：更新上下文 + 推送 + 重置状态"""
         # 更新中文上下文（保留最近 3 句）
         if zh_text:
             if self._context_zh:
@@ -365,17 +412,17 @@ class RealtimeTranslator:
         # 推送已提交字幕到前端（final=True）
         await self.ws_server.broadcast(text, zh_text)
 
-        # 重置所有句子状态
-        # 注意：不调用 recognizer.reset()！
-        # vosk 在产生 Result() 时已自动重置，手动 Reset 会导致
-        # 音频回调中的 AcceptWaveform 崩溃
-        # 我们只清除自己的文本缓冲区，vosk 的 partial 会自然刷新
-        self._last_committed = self._sentence_buffer.strip()
-        self._commit_time = time.time()
-        # 记录已提交片段用于后续 partial 多轮剥离
-        if self._last_committed:
-            self._committed_segments.append(self._last_committed)
-        self._sentence_buffer = ""
+        # 同步路径需要补设 _last_committed；异步路径已在 _commit_sentence 中设置
+        if self._last_committed != text:
+            self._last_committed = text
+            self._commit_time = time.time()
+            if self._last_committed:
+                self._committed_segments.append(self._last_committed)
+                self._committed_word_count += len(text.split())
+
+        # 清除 buffer（仅同步路径需要；异步路径已提前清除）
+        if self._sentence_buffer.strip() == text:
+            self._sentence_buffer = ""
         self._last_partial = ""
         self._speculative_zh = ""
         self._speculative_en = ""
@@ -401,6 +448,44 @@ class RealtimeTranslator:
                     await self.ws_server.broadcast_status(
                         "error", f"切换失败: {e}"
                     )
+        elif action == "switch_lang":
+            source_lang = data.get("source_lang")
+            target_lang = data.get("target_lang")
+            changed = False
+            if source_lang and source_lang != config.SOURCE_LANG:
+                # 检查是否有对应的 vosk 模型
+                if source_lang in config.VOSK_MODEL_MAP:
+                    config.SOURCE_LANG = source_lang
+                    config.VOSK_MODEL_PATH = os.path.join(
+                        os.path.dirname(__file__), "models",
+                        config.VOSK_MODEL_MAP.get(source_lang, "vosk-model-small-en-us-0.15")
+                    )
+                    changed = True
+                else:
+                    src_name = config.LANG_NAMES.get(source_lang, source_lang)
+                    await self.ws_server.broadcast_status(
+                        "error", f"暂不支持 {src_name} 语音识别（缺少 vosk 模型）"
+                    )
+                    return
+            if target_lang and target_lang != config.TARGET_LANG:
+                config.TARGET_LANG = target_lang
+                changed = True
+            if changed:
+                # 重置状态避免残留旧语言内容
+                self._sentence_buffer = ""
+                self._last_partial = ""
+                self._speculative_zh = ""
+                self._speculative_en = ""
+                self._committed_segments.clear()
+                self._committed_word_count = 0
+                self._context_zh = ""
+                src_name = config.LANG_NAMES.get(config.SOURCE_LANG, config.SOURCE_LANG)
+                tgt_name = config.LANG_NAMES.get(config.TARGET_LANG.replace("-CN", ""), config.TARGET_LANG)
+                print(f"[Main] 语言已切换: {src_name} → {tgt_name}")
+                await self.ws_server.broadcast_status(
+                    "lang_changed",
+                    f"{src_name} → {tgt_name}"
+                )
 
     async def run(self):
         """启动所有服务"""
@@ -408,6 +493,9 @@ class RealtimeTranslator:
         print("=" * 50)
         print(f"  实时音频翻译工具 (流式) [{_plat.system()}]")
         print(f"  翻译厂商: {config.TRANSLATOR_PROVIDER}")
+        src_name = config.LANG_NAMES.get(config.SOURCE_LANG, config.SOURCE_LANG)
+        tgt_name = config.LANG_NAMES.get(config.TARGET_LANG.replace('-CN', ''), config.TARGET_LANG)
+        print(f"  翻译语言: {src_name} → {tgt_name}")
         print(f"  ASR 引擎: vosk (流式)")
         print(f"  音频捕获: {self.recognizer.platform_info}")
         print(f"  投机翻译: {config.SPECULATIVE_WORD_COUNT}词触发, "
@@ -449,8 +537,13 @@ class RealtimeTranslator:
         for task in list(self._inflight_tasks):
             if not task.done():
                 task.cancel()
-        if self._inflight_tasks:
-            await asyncio.gather(*self._inflight_tasks, return_exceptions=True)
+        if self._pending_commit and not self._pending_commit.done():
+            self._pending_commit.cancel()
+        wait_tasks = list(self._inflight_tasks)
+        if self._pending_commit and not self._pending_commit.done():
+            wait_tasks.append(self._pending_commit)
+        if wait_tasks:
+            await asyncio.gather(*wait_tasks, return_exceptions=True)
         await self.translator.close()
         await self.ws_server.stop()
         print("[Main] 已停止")

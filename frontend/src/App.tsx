@@ -17,6 +17,8 @@ interface WSMessage {
   message?: string;
   status_type?: string;
   provider?: string;
+  source_lang?: string;
+  target_lang?: string;
 }
 
 interface ProviderInfo {
@@ -27,6 +29,32 @@ interface ProviderInfo {
 }
 
 const WS_URL = "ws://localhost:8765";
+
+const LANGUAGES = [
+  { id: "en", name: "英语" },
+  { id: "zh", name: "中文" },
+  { id: "ja", name: "日语" },
+  { id: "ko", name: "韩语" },
+  { id: "fr", name: "法语" },
+  { id: "de", name: "德语" },
+  { id: "es", name: "西班牙语" },
+  { id: "ru", name: "俄语" },
+  { id: "pt", name: "葡萄牙语" },
+  { id: "it", name: "意大利语" },
+];
+
+const TARGET_LANGUAGES = [
+  { id: "zh-CN", name: "中文" },
+  { id: "en", name: "英语" },
+  { id: "ja", name: "日语" },
+  { id: "ko", name: "韩语" },
+  { id: "fr", name: "法语" },
+  { id: "de", name: "德语" },
+  { id: "es", name: "西班牙语" },
+  { id: "ru", name: "俄语" },
+  { id: "pt", name: "葡萄牙语" },
+  { id: "it", name: "意大利语" },
+];
 
 const PROVIDERS: ProviderInfo[] = [
   { id: "mymemory", name: "MyMemory", desc: "免费无需密钥，速度快", needKey: false },
@@ -47,6 +75,8 @@ function App() {
   const [opacity, setOpacity] = useState(0.9);
   const [showSettings, setShowSettings] = useState(false);
   const [currentProvider, setCurrentProvider] = useState("mymemory");
+  const [sourceLang, setSourceLang] = useState("en");
+  const [targetLang, setTargetLang] = useState("zh-CN");
   const [isPinned, setIsPinned] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -65,6 +95,12 @@ function App() {
     setCurrentProvider(provider);
     setShowSettings(false);
     setStatus(`切换翻译: ${provider}`);
+  }, [sendCommand]);
+
+  const switchLang = useCallback((src: string, tgt: string) => {
+    sendCommand("switch_lang", { source_lang: src, target_lang: tgt });
+    setSourceLang(src);
+    setTargetLang(tgt);
   }, [sendCommand]);
 
   // Toggle always on top
@@ -117,6 +153,12 @@ function App() {
           if (msg.provider) {
             setCurrentProvider(msg.provider);
           }
+          if (msg.source_lang) {
+            setSourceLang(msg.source_lang);
+          }
+          if (msg.target_lang) {
+            setTargetLang(msg.target_lang);
+          }
         } else if (msg.type === "provider_info") {
           if (msg.provider) {
             setCurrentProvider(msg.provider);
@@ -160,6 +202,7 @@ function App() {
         <div className="title-bar-left">
           <span className={`status-dot ${connected ? "connected" : ""}`} />
           <span className="title-text">实时翻译</span>
+          <span className="provider-label">{LANGUAGES.find(l => l.id === sourceLang)?.name} → {TARGET_LANGUAGES.find(l => l.id === targetLang)?.name}</span>
           <span className="provider-label">{currentProvider}</span>
         </div>
         <div className="title-bar-right">
@@ -181,6 +224,34 @@ function App() {
             <div className="settings-header">
               <span>翻译设置</span>
               <button className="settings-close" onClick={() => setShowSettings(false)}>✕</button>
+            </div>
+            <div className="settings-section">
+              <div className="settings-label">源语言（识别）</div>
+              <div className="lang-list">
+                {LANGUAGES.map((l) => (
+                  <div
+                    key={l.id}
+                    className={`provider-item lang-item ${sourceLang === l.id ? "active" : ""}`}
+                    onClick={() => switchLang(l.id, targetLang)}
+                  >
+                    <div className="provider-name">{l.name}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="settings-section">
+              <div className="settings-label">目标语言（翻译输出）</div>
+              <div className="lang-list">
+                {TARGET_LANGUAGES.map((l) => (
+                  <div
+                    key={l.id}
+                    className={`provider-item lang-item ${targetLang === l.id ? "active" : ""}`}
+                    onClick={() => switchLang(sourceLang, l.id)}
+                  >
+                    <div className="provider-name">{l.name}</div>
+                  </div>
+                ))}
+              </div>
             </div>
             <div className="settings-section">
               <div className="settings-label">翻译服务</div>
@@ -213,7 +284,7 @@ function App() {
         {history.length === 0 && !liveEn ? (
           <div className="empty-hint">
             <p>等待音频输入...</p>
-            <p className="sub-hint">请确保 BlackHole 已配置且浏览器正在播放英文内容</p>
+            <p className="sub-hint">请确保 BlackHole 已配置且正在播放音频内容</p>
           </div>
         ) : (
           <>

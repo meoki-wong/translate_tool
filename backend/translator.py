@@ -21,16 +21,19 @@ class TranslatorBase(abc.ABC):
     """翻译器抽象基类"""
 
     @abc.abstractmethod
-    async def translate(self, text: str, context: str = "") -> str:
+    async def translate(self, text: str, context: str = "",
+                         source_lang: str = "", target_lang: str = "") -> str:
         """
         翻译文本
 
         Args:
-            text: 待翻译的英文文本
+            text: 待翻译文本
             context: 上下文（前几句翻译结果），用于提高连贯性
+            source_lang: 源语言代码（如 "en"），空则用 config 默认
+            target_lang: 目标语言代码（如 "zh-CN"），空则用 config 默认
 
         Returns:
-            翻译后的中文文本
+            翻译后的文本
         """
         ...
 
@@ -64,8 +67,9 @@ class TranslationCache:
         self._cache[key] = value
 
     @staticmethod
-    def make_key(text: str, provider: str) -> str:
-        return f"{provider}:{hashlib.md5(text.encode()).hexdigest()}"
+    def make_key(text: str, provider: str, source_lang: str = "", target_lang: str = "") -> str:
+        lang_suffix = f":{source_lang}->{target_lang}" if source_lang or target_lang else ""
+        return f"{provider}{lang_suffix}:{hashlib.md5(text.encode()).hexdigest()}"
 
 
 # ==================== 混元翻译（默认） ====================
@@ -89,9 +93,10 @@ class HunyuanTranslator(TranslatorBase):
         )
         self._models = models
 
-    async def translate(self, text: str, context: str = "") -> str:
+    async def translate(self, text: str, context: str = "",
+                         source_lang: str = "", target_lang: str = "") -> str:
         import asyncio
-        return await asyncio.to_thread(self._translate_sync, text, context)
+        return await asyncio.to_thread(self._translate_sync, text, context, source_lang, target_lang)
 
     def _make_msg(self, role: str, content: str):
         msg = self._models.Message()
@@ -99,11 +104,16 @@ class HunyuanTranslator(TranslatorBase):
         msg.Content = content
         return msg
 
-    def _translate_sync(self, text: str, context: str = "") -> str:
+    def _translate_sync(self, text: str, context: str = "",
+                         source_lang: str = "", target_lang: str = "") -> str:
+        src = source_lang or config.SOURCE_LANG
+        tgt = target_lang or config.TARGET_LANG
+        src_name = config.LANG_NAMES.get(src, src)
+        tgt_name = config.LANG_NAMES.get(tgt.replace("-CN", ""), tgt)
         req = self._models.ChatCompletionsRequest()
         req.Model = config.HUNYUAN_MODEL
         system_prompt = (
-            "你是专业英中翻译。将英文翻译为自然流畅的中文。"
+            f"你是专业{src_name}-{tgt_name}翻译。将{src_name}翻译为自然流畅的{tgt_name}。"
             "只输出译文，不要解释、不要加引号、不要加注释。"
         )
         if context:
@@ -141,7 +151,8 @@ class MyMemoryTranslator(TranslatorBase):
         text = re.sub(r'\s+', ' ', text).strip()
         return text
 
-    async def translate(self, text: str, context: str = "") -> str:
+    async def translate(self, text: str, context: str = "",
+                         source_lang: str = "", target_lang: str = "") -> str:
         text = self._clean_text(text)
         if not text:
             return ""
@@ -150,9 +161,14 @@ class MyMemoryTranslator(TranslatorBase):
         if len(text) > self.MAX_CHARS:
             text = text[:self.MAX_CHARS]
 
+        src = source_lang or config.SOURCE_LANG
+        tgt = target_lang or config.TARGET_LANG
+        src_code = config.LANG_CODE_MAP.get(src, {}).get("mymemory", src)
+        tgt_code = config.TARGET_LANG_CODE_MAP.get(tgt, {}).get("mymemory", tgt)
+
         resp = await self._client.get(
             self.BASE_URL,
-            params={"q": text, "langpair": "en|zh-CN"},
+            params={"q": text, "langpair": f"{src_code}|{tgt_code}"},
         )
         resp.raise_for_status()
         data = resp.json()
@@ -178,13 +194,18 @@ class DeepLTranslator(TranslatorBase):
             timeout=10,
         )
 
-    async def translate(self, text: str, context: str = "") -> str:
+    async def translate(self, text: str, context: str = "",
+                         source_lang: str = "", target_lang: str = "") -> str:
+        src = source_lang or config.SOURCE_LANG
+        tgt = target_lang or config.TARGET_LANG
+        src_code = config.LANG_CODE_MAP.get(src, {}).get("deepl", "EN")
+        tgt_code = config.TARGET_LANG_CODE_MAP.get(tgt, {}).get("deepl", "ZH")
         resp = await self._client.post(
             "/translate",
             data={
                 "text": text,
-                "target_lang": "ZH",
-                "source_lang": "EN",
+                "target_lang": tgt_code,
+                "source_lang": src_code,
                 "context": context,
             },
         )
@@ -206,9 +227,15 @@ class BaiduTranslator(TranslatorBase):
     def __init__(self):
         self._client = httpx.AsyncClient(timeout=10)
 
-    async def translate(self, text: str, context: str = "") -> str:
+    async def translate(self, text: str, context: str = "",
+                         source_lang: str = "", target_lang: str = "") -> str:
         import hashlib
         import random
+
+        src = source_lang or config.SOURCE_LANG
+        tgt = target_lang or config.TARGET_LANG
+        src_code = config.LANG_CODE_MAP.get(src, {}).get("baidu", src)
+        tgt_code = config.TARGET_LANG_CODE_MAP.get(tgt, {}).get("baidu", tgt)
 
         salt = str(random.randint(32768, 65536))
         sign_str = config.BAIDU_APP_ID + text + salt + config.BAIDU_SECRET_KEY
@@ -218,8 +245,8 @@ class BaiduTranslator(TranslatorBase):
             self.BASE_URL,
             params={
                 "q": text,
-                "from": "en",
-                "to": "zh",
+                "from": src_code,
+                "to": tgt_code,
                 "appid": config.BAIDU_APP_ID,
                 "salt": salt,
                 "sign": sign,
@@ -249,10 +276,15 @@ class OpenAITranslator(TranslatorBase):
             timeout=30,
         )
 
-    async def translate(self, text: str, context: str = "") -> str:
+    async def translate(self, text: str, context: str = "",
+                         source_lang: str = "", target_lang: str = "") -> str:
+        src = source_lang or config.SOURCE_LANG
+        tgt = target_lang or config.TARGET_LANG
+        src_name = config.LANG_NAMES.get(src, src)
+        tgt_name = config.LANG_NAMES.get(tgt.replace("-CN", ""), tgt)
         system_prompt = (
-            "You are a professional English-to-Chinese translator. "
-            "Translate the given English text into natural, fluent Chinese. "
+            f"You are a professional {src_name}-to-{tgt_name} translator. "
+            f"Translate the given {src_name} text into natural, fluent {tgt_name}. "
             "Output ONLY the translation, nothing else."
         )
         if context:
@@ -292,6 +324,14 @@ class OllamaTranslator(TranslatorBase):
         self._is_local = (
             "localhost" in self._base_url
             or "127.0.0.1" in self._base_url
+            or "10.1." in self._base_url
+            or "192.168." in self._base_url
+            or "172.16." in self._base_url
+            or "172.17." in self._base_url
+            or "172.18." in self._base_url
+            or "172.19." in self._base_url
+            or "172.2" in self._base_url
+            or "172.3" in self._base_url
         )
         self._client: Optional[httpx.AsyncClient] = (
             httpx.AsyncClient(
@@ -301,10 +341,15 @@ class OllamaTranslator(TranslatorBase):
             ) if self._is_local else None
         )
 
-    async def translate(self, text: str, context: str = "") -> str:
+    async def translate(self, text: str, context: str = "",
+                         source_lang: str = "", target_lang: str = "") -> str:
+        src = source_lang or config.SOURCE_LANG
+        tgt = target_lang or config.TARGET_LANG
+        src_name = config.LANG_CODE_MAP.get(src, {}).get("ollama", src)
+        tgt_name = config.TARGET_LANG_CODE_MAP.get(tgt, {}).get("ollama", tgt)
         system_prompt = (
-            "你是严格的英中翻译机。规则：\n"
-            "1. 仅输出用户输入英文的中文翻译，一句一译。\n"
+            f"你是严格的{src_name}-{tgt_name}翻译机。规则：\n"
+            f"1. 仅输出用户输入{src_name}文本的{tgt_name}翻译，一句一译。\n"
             "2. 不要解释、不要扩展、不要补充、不要联想。\n"
             "3. 不要加引号、括号、标题、标号或标记。\n"
             "4. 输入即使不完整也只译已有内容，不要猜测下文。\n"
@@ -319,7 +364,7 @@ class OllamaTranslator(TranslatorBase):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": text},
             ],
-            "stream": False,
+            "stream": True,
             # 防幻觉 / 防自由发挥：限制生成长度、降低随机性、设置停词
             "options": {
                 "temperature": 0.2,
@@ -332,20 +377,38 @@ class OllamaTranslator(TranslatorBase):
         last_err = None
         for attempt in range(self.MAX_RETRIES + 1):
             try:
+                # 构建流式请求上下文
                 if self._is_local and self._client is not None:
-                    resp = await self._client.post("/api/chat", json=payload)
-                    resp.raise_for_status()
-                    data = resp.json()
+                    stream_ctx = self._client.stream(
+                        "POST", "/api/chat", json=payload,
+                    )
                 else:
-                    async with httpx.AsyncClient(
+                    client = httpx.AsyncClient(
                         base_url=self._base_url,
                         headers=self._headers,
                         timeout=60,
-                    ) as client:
-                        resp = await client.post("/api/chat", json=payload)
-                        resp.raise_for_status()
-                        data = resp.json()
-                result = data["message"]["content"].strip()
+                    )
+                    stream_ctx = client.stream(
+                        "POST", "/api/chat", json=payload,
+                    )
+                # 流式读取：拼接所有 content chunk，遇到 done 即止
+                result_parts = []
+                async with stream_ctx as resp:
+                    async for line in resp.aiter_lines():
+                        if not line.strip():
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if chunk.get("done"):
+                            break
+                        content = chunk.get("message", {}).get("content", "")
+                        if content:
+                            result_parts.append(content)
+                if not self._is_local:
+                    await client.aclose()
+                result = "".join(result_parts).strip()
                 # 后处理：截到第一段，防止模型在译文后举例/补充/联想
                 if "\n\n" in result:
                     result = result.split("\n\n", 1)[0].strip()
@@ -411,19 +474,23 @@ class TranslatorManager:
         self._primary = cls()
         print(f"[Translator] 初始化翻译厂商: {self._provider_name}")
 
-    async def translate(self, text: str, context: str = "") -> str:
+    async def translate(self, text: str, context: str = "",
+                         source_lang: str = "", target_lang: str = "") -> str:
         """翻译文本（带缓存，无降级）"""
         if not text.strip():
             return ""
 
+        src = source_lang or config.SOURCE_LANG
+        tgt = target_lang or config.TARGET_LANG
+
         # 检查缓存
-        cache_key = TranslationCache.make_key(text, self._provider_name)
+        cache_key = TranslationCache.make_key(text, self._provider_name, src, tgt)
         cached = self._cache.get(cache_key)
         if cached:
             return cached
 
         # 直接调用选定的厂商，失败则抛异常
-        result = await self._primary.translate(text, context)
+        result = await self._primary.translate(text, context, src, tgt)
         self._cache.put(cache_key, result)
         return result
 
